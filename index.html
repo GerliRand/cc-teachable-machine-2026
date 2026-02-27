@@ -1,11 +1,261 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Teachable Machine</title>
+    <title>Teachable Machine - Go & Stop</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            line-height: 1.35;
+        }
+
+        button {
+            padding: 10px 14px;
+            margin-right: 10px;
+            cursor: pointer;
+            background-color: rgba(32, 178, 171, 0.336);
+            font-weight: 700;
+        }
+
+        .box {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 12px 0;
+        }
+
+        #state {
+            font-weight: 700;
+        }
+
+        #log {
+            white-space: pre-wrap;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 10px;
+            height: 400px;
+            overflow: auto;
+        }
+
+        .small {
+            color: #666;
+            font-size: 0.95em;
+        }
+
+        code {
+            background: #f6f6f6;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+
+        .color {
+            color: lightseagreen;
+        }
+    </style>
 </head>
+
+
 <body>
-    
+    <h2 class="color">Teachable Machine Audio – GO/STOP demo</h2>
+    <p class="small">
+        This page loads files <code>model.json</code> + <code>metadata.json</code> + <code>weights.bin</code>
+        from the same dictonary and listens to the microphone.
+    </p>
+
+    <div class="box">
+        <button onclick="startListening()">Start listening</button>
+        <button onclick="stopListening()">Stop listening</button>
+
+        <p><b>Detected:</b> <span id="detected">-</span></p>
+        <p><b>Confidence:</b> <span id="conf">-</span></p>
+        <p><b>State:</b> <span id="state">STOPPED</span></p>
+        <p><b>Timer:</b> <span id="timer">0.0</span> s</p>
+    </div>
+
+    <!--Debug näkymä-->
+    <h3>Scores</h3>
+    <div id="scores" class="box"></div>
+
+    <!--Logi ikkuna, sinne tulostuu kaikki tapahtumat-->
+    <h3>Log</h3>
+    <div id="log"></div>
+
+    <!-- Kirjastot: TensorFlow.js ja Speech Commands -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@1.3.1/dist/tf.min.js"></script>
+    <script
+        src="https://cdn.jsdelivr.net/npm/@tensorflow-models/speech-commands@0.4.0/dist/speech-commands.min.js"></script>
+
+    <script>
+        const MODEL_BASE = "./";
+
+        let recognizer = null;
+
+        // running = true => timer käynnissä
+        // running = false => timer pysähtyy 
+        let running = false;
+        let startTime = 0;
+        let rafId = null;
+
+        let lastBgNoiseLogAt = 0;
+
+        // Estä samaan komennon laukamisen koko ajan
+        let lastAction = "";
+        let lastActionAt = 0;
+
+        // Päivitettään teksti
+        function ui(id, text) {
+            document.getElementById(id).textContent = text;
+        }
+
+        // Funktio joka päivittää käyttöliittymän login
+        function log(msg) {
+            const el = document.getElementById("log");
+            const line = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+            el.textContent = line + el.textContent;
+            //console.log(msg);
+        }
+
+        // Muutetaan sovelluksen tilaa (RUNNING/STOPPED)
+        // Käynnistetään / pysäytetään timer
+        function setRunning(isRunning) {
+            running = isRunning;
+            ui("state", running ? "RUNNING" : "STOPPED");
+
+            if (running) {
+                startTime = performance.now();
+                tick();
+            } else {
+                if (rafId) cancelAnimationFrame(rafId);
+                rafId = null;
+            }
+        }
+
+        // Funktio, joka päivittää timerin arvoa n. 60 kertaa sekunnissa 
+        function tick() {
+            if (!running) return;
+            const t = (performance.now() - startTime) / 1000;
+            ui("timer", t.toFixed(1));
+            rafId = requestAnimationFrame(tick);
+        }
+
+        // Ladataan Teachable Machine -tiedostot
+        async function loadModel() {
+            const checkpointURL = new window.URL("model.json", window.location.href).href;
+            const metadataURL = new window.URL("metadata.json", window.location.href).href;
+
+            // speechCommands.create -> tekee audio-luokittelijan selaimeen
+            const r = speechCommands.create(
+                "BROWSER_FFT",
+                undefined,
+                checkpointURL,
+                metadataURL
+            );
+
+            // Ladataan malli muistiin ennen käyttöä
+            await r.ensureModelLoaded();
+            return r;
+        }
+
+        // Palauttaa parhaan luokan (eli ns. korkein score)
+        function getBestLabel(scores, labels) {
+            let bestI = 0;
+            for (let i = 1; i < scores.length; i++) {
+                if (scores[i] > scores[bestI]) bestI = i;
+            }
+            return { label: labels[bestI], score: scores[bestI] };
+        }
+
+        // Käynnistää mallin kuuntelun ja reagoinnin Go/Stop-komentoihin
+        async function startListening() {
+            if (!recognizer) {
+                recognizer = await loadModel();
+                log("Model loaded. Labels: " + recognizer.wordLabels().join(", "));
+            }
+
+            log("Listening started. Allow microphone permission if asked.");
+
+            const labels = recognizer.wordLabels();  // Luokkien nimet metadata.json:sta (esim. Go)
+
+            // ÄÄNENTUNNISTUS
+            recognizer.listen(result => {
+                // Debug-näkymä, näytettään kaikkien luokkien scoret
+                const scoreLines = labels.map((lab, i) => `${lab}: ${result.scores[i].toFixed(2)}`).join("<br>");
+                document.getElementById("scores").innerHTML = scoreLines;
+
+                // Valitaan paras luokka ja näytettään se ja sen score
+                const { label, score } = getBestLabel(result.scores, labels);
+                ui("detected", label);
+                ui("conf", score.toFixed(2));
+
+                const now = Date.now();
+                // Estetään saman komennon laukeamineen jatkuvasti
+                const isNewEnough = (label !== lastAction) || (now - lastActionAt > 600);
+
+                // Asetetaan ns. luottamuusrajat
+                const go = 0.65;
+                const stop = 0.65;
+                const background = 0.60;
+
+                // Haetaan backgroun noise -score
+                const bgIndex = labels.findIndex(x => x.trim().toLowerCase() === "background noise");
+                const bgScore = bgIndex >= 0 ? result.scores[bgIndex] : 0;
+
+                // BACKGROUND NOISE
+                if (bgScore >= background) {
+                    const bg_log_interval = 2000;
+                    if (now - lastBgNoiseLogAt > bg_log_interval) {
+                        lastBgNoiseLogAt = now;
+                        log(`BACKGROUND (score ${bgScore.toFixed(2)})`);
+                    }
+                    return; // huom. ei käsitellä go/stop samalla kierroksella
+                }
+
+                const detectedWord = label.trim().toLowerCase();
+
+                // GO
+                // jos tunnistettu sana on go ja luottamuusraja ns. ylittyy ja samaa komento
+                // ei ole ollut äsken -> suoritetaan GO toiminto
+                if (detectedWord === "go" && score >= go && isNewEnough) {
+                    lastAction = label;
+                    lastActionAt = now;
+
+                    setRunning(true);
+                    log(`GO action (score ${score.toFixed(2)})`);
+                    return;
+                }
+
+                // STOP
+                if (detectedWord === "stop" && score >= stop && isNewEnough) {
+                    lastAction = label;
+                    lastActionAt = now;
+
+                    setRunning(false);
+                    log(`STOP action (score ${score.toFixed(2)})`);
+                    return;
+                }
+
+            }, {
+                probabilityThreshold: 0.10,
+                overlapFactor: 0.50
+            });
+        }
+
+        // Funktio, jolla pysäytetään sovellus
+        function stopListening() {
+            if (recognizer) {
+                recognizer.stopListening();
+                log("Listening stopped.");
+            }
+            // Asetetaan STOPPED ja nollataan näkymä
+            setRunning(false);
+            ui("detected", "-");
+            ui("conf", "-");
+            ui("timer", "0.0");
+        }
+    </script>
 </body>
+
 </html>
